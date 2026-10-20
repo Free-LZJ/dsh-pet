@@ -94,11 +94,11 @@
  *             依赖可解析后替换为 DSH 官方类型。
  */
 import { spawn } from 'node:child_process';
-import { createReadStream, existsSync, fstatSync, readFileSync } from 'node:fs';
+import { appendFileSync, createReadStream, existsSync, fstatSync, mkdirSync, readFileSync } from 'node:fs';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { homedir } from 'node:os';
-import { join, normalize, resolve, sep } from 'node:path';
+import { basename, dirname, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
@@ -205,34 +205,130 @@ export function dshOpenCommand(platform: NodeJS.Platform): { command: string; ar
   return undefined;
 }
 
+/** 只用到 warn 的宽松 logger 形状（宿主注入的 logger / 测试桩都满足） */
+type WarnLogger = { warn?: (...args: unknown[]) => void };
+
+/**
+ * Windows 抢前台的 PowerShell 脚本（纯函数，可测）。
+ *
+ * 三步，缺一不可（都是本机实测出来的）：
+ *   1. `ShowWindow(SW_RESTORE)`：最小化的窗口先还原；
+ *   2. `SetWindowPos(HWND_TOPMOST)` + 300ms 后 `HWND_NOTOPMOST`：**把被遮挡的窗口顶到最前**。
+ *      TOPMOST 是窗口样式不是前台请求，不受前台锁限制；实测「记事本挡着 DSH」→ 顶到最上，
+ *      取消置顶后仍留在最上（这是 Electron 社区那套 `setAlwaysOnTop(true) → false` 的 Win32 等价物）；
+ *   3. `SwitchToThisWindow`：连带把**键盘焦点**也拿过来（user32 里同样的前台锁绕法）。
+ *
+ * 为什么不能只靠 `dsh://`：那条路只能让 DSH 自己 `restore() + show() + focus()`，而 Windows 前台锁
+ * 会拒绝后台进程的前台请求——实测窗口恢复了、却仍被别的窗口盖着，用户看起来就是"点了没反应"。
+ *
+ * 窗口按宿主 exe 名找（host 自己就是那个 exe 以 `ELECTRON_RUN_AS_NODE` 起的）；找不到（应用没跑）
+ * 就什么也不做，由同时发出的 `dsh://open` 负责把应用拉起来。
+ *
+ * @param logPath 诊断日志（临时）：PowerShell 侧把「找没找到窗口」写进去，用来区分"点击没到 host"
+ *   和"到了但抢前台失败"。不传就不写日志。
+ *
+ * ponytail: 每次点击起一个 powershell（冷启动 + Add-Type 编译，实测约 0.5–1s，与"窗口跳出来"同一拍）。
+ * 真嫌慢就上常驻辅助进程 / 预编译 DLL，等实测觉得慢再说。
+ */
+export function windowsFocusScript(exeName: string, logPath?: string): string {
+  // PowerShell 单引号字符串里，单引号翻倍转义
+  const name = exeName.replace(/'/g, "''");
+  const log = logPath === undefined ? undefined : `'${logPath.replace(/'/g, "''")}'`;
+  const okLog =
+    log === undefined
+      ? ''
+      : `; Add-Content -LiteralPath ${log} -Value ('ok ' + (Get-Date -Format o) + ' pid=' + $p.Id)`;
+  const missLog =
+    log === undefined ? '$null' : `Add-Content -LiteralPath ${log} -Value ('notfound ' + (Get-Date -Format o))`;
+  return [
+    '$ErrorActionPreference = "SilentlyContinue"',
+    'Add-Type -Namespace DshPet -Name W -MemberDefinition \'[DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr hWnd, bool fUnknown); [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags); [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);\'',
+    `$p = Get-Process -Name '${name}' | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1`,
+    `if ($p) { $h = $p.MainWindowHandle; [DshPet.W]::ShowWindow($h, 9); [DshPet.W]::SetWindowPos($h, [IntPtr](-1), 0, 0, 0, 0, 3); [DshPet.W]::SwitchToThisWindow($h, $true); Start-Sleep -Milliseconds 300; [DshPet.W]::SetWindowPos($h, [IntPtr](-2), 0, 0, 0, 0, 3)${okLog} } else { ${missLog} }`,
+  ].join('; ');
+}
+
+/** 宿主 exe 名（Windows 上 DSH 桌面应用的进程名，如 `DeepSeek Harness`） */
+const hostExeName = (): string => basename(process.execPath, '.exe');
+
+/** Windows PowerShell 的绝对路径（不走 PATH：宿主环境的 PATH 不保证含它，spawn 静默 ENOENT 最难查） */
+const powershellExe = (): string => {
+  const absolute = join(
+    process.env.SystemRoot ?? 'C:\\Windows',
+    'System32',
+    'WindowsPowerShell',
+    'v1.0',
+    'powershell.exe',
+  );
+  return existsSync(absolute) ? absolute : 'powershell.exe';
+};
+
+/** 唤起诊断日志（临时：定位"点击通知不置顶"用，问题收口后应删） */
+const revealLogPath = (): string => join(resolveDshHome(), 'dsh-pet', 'reveal.log');
+
+/** 往唤起诊断日志追加一行（失败静默：日志不该影响唤起） */
+function logReveal(line: string): void {
+  try {
+    const path = revealLogPath();
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, `${new Date().toISOString()} ${line}\n`, 'utf8');
+  } catch {
+    /* 记不上就算了 */
+  }
+}
+
+/**
+ * 起一个一次性辅助命令（不等它、不拖住宿主）。
+ *
+ * **必须删 `ELECTRON_RUN_AS_NODE`**：宿主自己就是被这个变量以纯 Node 模式拉起来的（见 dsh.cmd），
+ * 原样透传会给 `dsh://` 的处理程序（DSH exe）——起出来是 node 而非界面，协议空转、窗口照旧不出现
+ * （与 issue #63 同一个坑，见 helperSpawnEnv）。
+ *
+ * **不许加 `detached: true`**：Windows 上它对应 `DETACHED_PROCESS`，与隐藏窗口用的
+ * `CREATE_NO_WINDOW`（`windowsHide`）撞车——实测同一段 PowerShell 脚本，detached 版连一行日志都
+ * 写不出来（进程根本没起来），去掉 detached 立刻正常。要"起完就撒手"用 `unref()` 就够了。
+ *
+ * 失败只记日志：spawn 失败异步 emit 'error'，无人监听会升级成未捕获异常直接崩掉宿主——
+ * 唤起失败只该是"通知点了没反应"，不能反噬宿主。
+ */
+function spawnOneShot(command: string, args: string[], logger?: WarnLogger): void {
+  try {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    delete env.ELECTRON_RUN_AS_NODE;
+    const child = spawn(command, args, { stdio: 'ignore', windowsHide: true, env });
+    child.once('error', (e: Error) => logger?.warn?.(`[dsh-pet] 唤起桌面窗口失败：${e.message}`));
+    child.unref();
+  } catch (e) {
+    logger?.warn?.(`[dsh-pet] 唤起桌面窗口失败：${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 /**
  * 把 DSH 桌面应用主窗口叫回前台（最小化 → 恢复 + 前置）；宿主不是桌面应用时 no-op。
  *
  * 【为什么必须由宿主侧发起】系统通知是**网页**（Electron 渲染进程）发的，那边的
- * `window.focus()` 只能聚焦页面，恢复不了最小化的宿主窗口——Windows 的 SetForegroundWindow
- * 对最小化窗口不还原（用户报的"点了通知打不开 DSH"）。页面够不着的这层只能由宿主动手。
+ * `window.focus()` 只能聚焦页面，恢复不了最小化的宿主窗口——页面够不着的这层只能由宿主动手。
  *
- * 【必须删 ELECTRON_RUN_AS_NODE】宿主自己就是被这个变量以纯 Node 模式拉起来的（见 dsh.cmd），
- * 原样透传会给 `dsh://` 的处理程序（DSH exe）——起出来是 node 而非界面，协议空转、窗口照旧不出现
- * （与 issue #63 同一个坑，见 helperSpawnEnv）。
+ * 【Windows 两条腿，缺一不可】
+ *   ① `SwitchToThisWindow` 直接抢前台：`dsh://` 那条路受前台锁限制（窗口回来了却压在别的窗口下面）；
+ *   ② `dsh://open` 兜住"应用根本没跑 / 窗口被隐藏"：找不到窗口时 ①什么也不做。
  */
-export function revealDesktopWindow(logger?: { warn?: (...args: unknown[]) => void }): boolean {
+export function revealDesktopWindow(logger?: WarnLogger): boolean {
   if (!isDesktopHost()) return false;
   const spec = dshOpenCommand(process.platform);
   if (!spec) return false;
-  try {
-    const env: NodeJS.ProcessEnv = { ...process.env };
-    delete env.ELECTRON_RUN_AS_NODE;
-    const child = spawn(spec.command, spec.args, { detached: true, stdio: 'ignore', windowsHide: true, env });
-    // 生态差异：spawn 失败（无 cmd.exe / 无 xdg-open）异步 emit 'error'，无人监听会升级成
-    // 未捕获异常直接崩掉宿主——唤起失败只该是"通知点了没反应"，不能反噬宿主。
-    child.once('error', (e: Error) => logger?.warn?.(`[dsh-pet] 唤起桌面窗口失败：${e.message}`));
-    child.unref();
-    return true;
-  } catch (e) {
-    logger?.warn?.(`[dsh-pet] 唤起桌面窗口失败：${e instanceof Error ? e.message : String(e)}`);
-    return false;
+  if (process.platform === 'win32') {
+    const ps = powershellExe();
+    const exe = hostExeName();
+    logReveal(`reveal called exe="${exe}" ps="${ps}" psFound=${String(existsSync(ps))}`);
+    spawnOneShot(
+      ps,
+      ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', windowsFocusScript(exe, revealLogPath())],
+      logger,
+    );
   }
+  spawnOneShot(spec.command, spec.args, logger);
+  return true;
 }
 
 /** 不同扩展名对应的 Content-Type 映射 */

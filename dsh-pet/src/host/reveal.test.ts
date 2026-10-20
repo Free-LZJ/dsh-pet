@@ -25,7 +25,7 @@ import { join } from 'node:path';
 import { Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
-import { apply, dshOpenCommand, revealDesktopWindow } from './index.ts';
+import { apply, dshOpenCommand, revealDesktopWindow, windowsFocusScript } from './index.ts';
 
 const readSource = (rel: string): string => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
 const host = readSource('./index.ts');
@@ -46,16 +46,56 @@ describe('点击通知唤起 DSH 桌面窗口', () => {
     assert.equal(revealDesktopWindow(), false);
   });
 
-  test('spawn 契约：删 ELECTRON_RUN_AS_NODE + 脱离父进程收场', () => {
+  test('spawn 契约：删 ELECTRON_RUN_AS_NODE + 不许 detached', () => {
     assert.ok(
       /delete env\.ELECTRON_RUN_AS_NODE/.test(host),
       '必须删掉 ELECTRON_RUN_AS_NODE，否则 dsh:// 处理程序被起成 node 进程，协议空转（issue #63）',
     );
     assert.ok(
-      /spawn\(spec\.command, spec\.args, \{ detached: true, stdio: 'ignore', windowsHide: true, env \}\)/.test(host),
-      'detached + ignore + 复用清理过的 env：唤起完就撒手，不拖住宿主',
+      /spawn\(command, args, \{ stdio: 'ignore', windowsHide: true, env \}\)/.test(host),
+      'ignore + windowsHide + unref：起完就撒手，不拖住宿主',
+    );
+    assert.ok(
+      !/\{\s*detached: true/.test(host),
+      '不许 detached：Windows 上 DETACHED_PROCESS 与 CREATE_NO_WINDOW 撞车——实测同一段脚本 detached 版连日志都写不出来',
     );
     assert.ok(/child\.once\('error'/.test(host), "spawn 失败异步 emit 'error'：不监听会升级成未捕获异常直接崩掉宿主");
+  });
+
+  test('Windows 抢前台：TOPMOST 顶最前 + SwitchToThisWindow 拿焦点', () => {
+    // 前台锁：dsh:// 只能 restore+focus，实测窗口回来了仍被别的窗口盖着（用户报的「不置顶」）
+    assert.ok(
+      /\[DshPet\.W\]::SwitchToThisWindow\(\$h, \$true\)/.test(host),
+      'Windows 必须用 SwitchToThisWindow 抢前台——SetForegroundWindow 会被前台锁拒绝',
+    );
+    assert.ok(
+      /SetWindowPos\(\$h, \[IntPtr\]\(-1\)[\s\S]*?SetWindowPos\(\$h, \[IntPtr\]\(-2\)/.test(host),
+      '「被遮挡」（非最小化）只能靠 TOPMOST → NOTOPMOST 顶到最前：实测记事本挡着 DSH 时有效',
+    );
+    assert.ok(/ShowWindow\(\$h, 9\)/.test(host), '最小化的窗口要先 SW_RESTORE');
+    assert.ok(
+      /powershellExe[\s\S]*?WindowsPowerShell/.test(host),
+      'powershell 走绝对路径：宿主 PATH 不保证含它，spawn 静默 ENOENT 是最难查的失败',
+    );
+    assert.ok(
+      /process\.platform === 'win32'[\s\S]*?windowsFocusScript\(exe, revealLogPath\(\)\)/.test(host),
+      '只在 win32 走这条 PowerShell 绕法（macOS 的 open / Linux 的 xdg-open 不需要）',
+    );
+    assert.ok(
+      /const hostExeName = \(\): string => basename\(process\.execPath, '\.exe'\)/.test(host),
+      '窗口按宿主 exe 名找（host 自己就是那个 exe 以 ELECTRON_RUN_AS_NODE 起的），不许硬编码进程名',
+    );
+  });
+
+  test('windowsFocusScript：纯函数，进程名与日志路径都转义到位', () => {
+    const script = windowsFocusScript("DeepSeek Harness's");
+    assert.ok(script.includes("DeepSeek Harness''s"), 'PowerShell 单引号字符串里的单引号必须翻倍转义');
+    assert.ok(script.includes('MainWindowHandle -ne 0'), '没窗口的进程要跳过（否则 MainWindowHandle=0 会乱指）');
+    assert.ok(!script.includes('undefined'), '参数缺失不许把 undefined 拼进脚本');
+
+    const withLog = windowsFocusScript('X', "C:\\a'b\\reveal.log");
+    assert.ok(withLog.includes("C:\\a''b\\reveal.log"), '日志路径同样要按 PowerShell 规则转义');
+    assert.ok(withLog.includes('Add-Content -LiteralPath'), '传了日志路径就要写诊断行（区分"没找到窗口"）');
   });
 
   test('宿主路由：POST /reveal 才唤起，其余方法 405', () => {
@@ -75,8 +115,12 @@ describe('点击通知唤起 DSH 桌面窗口', () => {
       '点击处理必须 POST /reveal（浏览器宿主下 window.focus() 是另一条腿，两者都要）',
     );
     assert.ok(
-      /wireNotificationClick\(new Notification\(title, opts\), sessionId\)/.test(clientNotify),
+      /wireNotificationClick\(n, sessionId\)/.test(clientNotify),
       '事件通知必须走同一个点击处理，不许自己再写一份 onclick',
+    );
+    assert.ok(
+      /liveNotifications\.add\(n\)/.test(clientNotify),
+      '通知对象必须被强引用持有：Chromium 侧对象被 GC 后点击回调可能再也收不到（「点了没反应」的成因之一）',
     );
     assert.ok(
       /wireNotificationClick\(\s*new Notification\('测试通知'/.test(settings),
@@ -92,7 +136,7 @@ describe('点击通知跳到对应会话', () => {
       '必须先切会话再叫窗口回前台（顺序反了用户会先看到旧会话）',
     );
     assert.ok(
-      /sessionNavigator\?\.openSession\(sessionId\)/.test(clientNotify),
+      /sessionNavigator\.openSession\(sessionId\)/.test(clientNotify),
       '切会话只能经注入的跳转器——notify.ts 不直接摸 DSH 服务，取不到时天然退化成不跳会话',
     );
     assert.ok(

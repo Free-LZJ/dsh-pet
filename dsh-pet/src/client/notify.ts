@@ -70,19 +70,26 @@ export const NOTIFY_ICONS = {
 /** 当前生效的总开关（运行中可被 reloadNotifications 更新——设置页保存后即时生效，无需刷新） */
 let notifyEnabled = true;
 
+/** 还在显示的**原生通知对象**（强引用）：Chromium 侧通知对象一旦被 GC，点击回调就可能再也收不到
+ *  ——「点了没反应」的一个已知成因。持有到它关闭（点击 / 超时 / 手动关都会触发 close）为止。 */
+const liveNotifications = new Set<Notification>();
+
 /** 发一条系统通知；总开关关闭 / 环境不支持 / 未授权 / 聚焦本页 时静默跳过。
  * 日志（【弹窗】类型：内容）在门之后记录——只有真正发出通知时才记，被门拦下的触发不产生日志。 */
 function toast(title: string, body?: string, icon?: string, sessionId?: string): void {
   if (!notifyEnabled) return;
   if (isPageActive()) return;
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
-  console.log('【弹窗】' + title + (body ? '：' + body : ''));
+  console.log('【弹窗】' + title + (body ? '：' + body : '') + '（会话 ' + String(sessionId) + '）');
   try {
     const opts: NotificationOptions = {};
     if (body) opts.body = truncate(body);
     if (icon) opts.icon = icon;
+    const n = new Notification(title, opts);
+    liveNotifications.add(n);
+    n.onclose = () => liveNotifications.delete(n);
     // 图标加载失败只降级为无图标，绝不关闭弹窗
-    wireNotificationClick(new Notification(title, opts), sessionId);
+    wireNotificationClick(n, sessionId);
   } catch {
     /* 个别环境（e.g. 部分桌面壳）可能在构造时抛错：忽略，不打断业务 */
   }
@@ -101,8 +108,13 @@ let sessionNavigator: SessionNavigator | undefined;
 
 /** 页内跳到指定会话（失败只记日志，绝不影响"把窗口叫回前台"那条腿） */
 function openSessionInPage(sessionId: string): void {
+  if (!sessionNavigator) {
+    console.warn('[dsh-pet] 没有会话跳转器（DSH 客户端 uiWorkspace 服务拿不到）——只把窗口叫回前台');
+    return;
+  }
   try {
-    sessionNavigator?.openSession(sessionId);
+    sessionNavigator.openSession(sessionId);
+    console.log('[dsh-pet] 已请求跳到会话 ' + sessionId);
   } catch (e) {
     console.warn('[dsh-pet] 跳转到会话失败：' + (e instanceof Error ? e.message : String(e)));
   }
@@ -123,6 +135,9 @@ function openSessionInPage(sessionId: string): void {
  */
 export function wireNotificationClick(n: Notification, sessionId?: string): void {
   n.onclick = () => {
+    console.log(
+      '[dsh-pet] 通知被点击：sessionId=' + String(sessionId) + '，跳转器=' + (sessionNavigator ? '有' : '无'),
+    );
     n.close();
     if (sessionId !== undefined) openSessionInPage(sessionId);
     window.focus();
@@ -201,6 +216,7 @@ export function notifyFromFrame(frame: unknown): void {
  */
 export function initNotify(navigator?: SessionNavigator): () => void {
   sessionNavigator = navigator;
+  console.log('[dsh-pet] 通知引擎就绪：会话跳转=' + (navigator ? '可用' : '不可用'));
   // 总开关读成品配置（拉取失败不阻塞，默认开启）；之后由设置页保存后 reloadNotifications 重读
   void readNotificationsEnabled().then((enabled) => {
     notifyEnabled = enabled;
