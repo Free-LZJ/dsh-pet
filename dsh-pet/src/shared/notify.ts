@@ -28,6 +28,12 @@ export function truncate(text: string): string {
 /** 通知帧（浏览器 mux/host 流的帧形状） */
 export interface NotifyFrame {
   type: string;
+  /**
+   * 发出这条通知的会话 id（host 侧 sessionIdOf 填）。
+   * 点击通知时网页据此跳到那条会话；没有会话位置的事件（host/agent-error）不带这个字段，
+   * 消费端把缺失一律当成"只把窗口叫回前台"，不做任何猜测。
+   */
+  sessionId?: string;
   [key: string]: unknown;
 }
 

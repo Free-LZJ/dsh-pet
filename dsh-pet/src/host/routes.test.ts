@@ -190,6 +190,19 @@ describe('/models 路由 —— 设置页「AI 模型」下拉框的数据源', 
   });
 });
 
+describe('/reveal —— 点击系统通知唤起 DSH 桌面窗口', () => {
+  test('非桌面宿主：POST 回 { revealed:false }（无窗口可唤，不当错误）', async () => {
+    // 测试进程是纯 Node（取不到 process.versions.electron）→ 非桌面宿主，正是 dsh web / 独立模式那档
+    const r = await call('/dsh-pet-7340/reveal', 'POST');
+    assert.equal(r.status, 200);
+    assert.deepEqual(JSON.parse(r.body), { revealed: false });
+  });
+
+  test('非 POST → 405（点击只发一次动作，不是可读端点）', async () => {
+    assert.equal((await call('/dsh-pet-7340/reveal', 'GET')).status, 405);
+  });
+});
+
 describe('/state + /balance —— 轮询统一状态与余额动作端点', () => {
   test('GET /state 返回 { sections, pets }（初始叶子 counter=0 / data=null）', async () => {
     const r = await call('/dsh-pet-7340/state');

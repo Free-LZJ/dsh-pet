@@ -1797,6 +1797,37 @@ paths:
         "405":
           $ref: "#/components/responses/MethodNotAllowed"
 
+  /dsh-pet-7340/reveal:
+    post:
+      tags: [Action]
+      operationId: reveal
+      summary: 把 DSH 桌面应用主窗口叫回前台
+      description: |
+        点击系统通知时由浏览器半侧调用（`src/client/notify.ts`）。桌面宿主（DSH 桌面应用）下
+        通知是**网页**发的，那边的 `window.focus()` 只能聚焦页面、恢复不了**最小化**的宿主窗口，
+        这一层只能由宿主发起。
+
+        实现走 DSH 桌面端自注册的 `dsh://` 协议（第二实例锁 → `focusPrimaryWindow()`：
+        `isMinimized() → restore()` + `show()` + `focus()`），与桌面 Helper 右键
+        「打开 DeepSeek Harness」是同一条路。
+
+        宿主不是桌面应用（`dsh web` / 独立模式）时是 **no-op**：回 `{"revealed": false}` 而不是错误——
+        浏览器宿主本来就会自己把标签页/窗口带到前台。
+      responses:
+        "200":
+          description: |
+            已尝试唤起。`revealed:false` = 宿主不是桌面应用（无窗口可唤，浏览器宿主下的正常结果）。
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revealed]
+                properties:
+                  revealed:
+                    type: boolean
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+
   "/dsh-pet-7340/thumb/{petId}/{file}":
     get:
       tags: [Assets]
@@ -2426,6 +2457,8 @@ components:
         type:
           type: string
           const: session/event
+        sessionId:
+          $ref: "#/components/schemas/NotifySessionId"
         event:
           type: object
           required: [type, data]
@@ -2456,6 +2489,8 @@ components:
         type:
           type: string
           const: approval/requested
+        sessionId:
+          $ref: "#/components/schemas/NotifySessionId"
         toolName:
           type: string
           description: 申请权限的工具名（可选）
@@ -2471,6 +2506,8 @@ components:
         type:
           type: string
           const: question/requested
+        sessionId:
+          $ref: "#/components/schemas/NotifySessionId"
         questions:
           type: array
           minItems: 1
@@ -2483,13 +2520,23 @@ components:
     AgentErrorFrame:
       type: object
       required: [type, message]
-      description: 无回合位置的生成失败（DSH 0.1.5+ 的 `agent/error` 事件）
+      description: |
+        无回合位置的生成失败（DSH 0.1.5+ 的 `agent/error` 事件）。
+        **不带 `sessionId`**：该事件载荷里没有会话标识（宿主的 throwError 没传会话进来），
+        因此点击这类通知只会把窗口叫回前台，不会跳会话。
       properties:
         type:
           type: string
           const: host/agent-error
         message:
           type: string
+
+    NotifySessionId:
+      type: string
+      description: |
+        发出这条通知的会话 id（宿主从 `session/event` 的会话参数上取）。
+        点击通知时网页据此跳到该会话（DSH 客户端 `uiWorkspace.openSession`）；
+        缺失（旧版宿主 / 拿不到会话的事件）= 只把窗口叫回前台，不做任何猜测。
 
     AnimLeaf:
       type: object

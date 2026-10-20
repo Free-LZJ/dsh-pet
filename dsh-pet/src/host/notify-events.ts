@@ -114,6 +114,17 @@ export function turnEndNotifyKind(kind: string | undefined): 'completed' | 'erro
   return null;
 }
 
+/**
+ * 把会话 id 附到通知帧上 —— 点击通知时网页据此跳到那条会话（客户端 `uiWorkspace.openSession`）。
+ *
+ * `sessionIdOf` 的兜底值是字符串 `'unknown'`（它同时是活动门定时器的 Map 键，必须有值），
+ * 但那不是一条真会话，不能拿去跳转：只有真 id 才写进帧，取不到就原样返回，
+ * 点击退化成「只把窗口叫回前台」——与「判据不可用时放行」同一条兜底原则。
+ */
+export function withSessionId(frame: HostNotifyFrame, sessionId: string): HostNotifyFrame {
+  return sessionId === 'unknown' ? frame : { ...frame, sessionId };
+}
+
 /** ask_user_question 工具名（与 work-status.ts 同源；该工具触发时模型在等用户选择题答复） */
 const USER_QUESTION_TOOL = 'ask_user_question';
 

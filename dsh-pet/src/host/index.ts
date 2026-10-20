@@ -23,6 +23,8 @@
  *   /dsh-pet-7340/reload              → 桌面端「重载配置」（右键菜单，POST）：重启桌面 Helper，全部桌面
  *                                宠物窗口按最新配置重建（改配置文件后不必回设置页点保存）；与保存走
  *                                **同一条**重启路径（syncDesktop），宠物数量/display/size 变化同样生效
+ *   /dsh-pet-7340/reveal              → 系统通知被点击（POST）：把 DSH 桌面应用主窗口叫回前台
+ *                                （最小化 → 恢复 + 前置）。宿主非桌面应用时 no-op（回 {revealed:false}）
  *   /dsh-pet-7340/config/meta         → 配置文件与素材目录路径 + 全部存储位置清单
  *                                       （设置页「高级配置」「卸载与存储」展示用）
  *   /dsh-pet-7340/models              → 可选「服务商 + 模型」清单（设置页「AI 模型」下拉框数据源；
@@ -91,6 +93,7 @@
  * TODO(类型)：peer 依赖类型包本地暂不可解析，ctx/req/res 暂用 any；
  *             依赖可解析后替换为 DSH 官方类型。
  */
+import { spawn } from 'node:child_process';
 import { createReadStream, existsSync, fstatSync, readFileSync } from 'node:fs';
 import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -147,6 +150,7 @@ import {
   reduceNotifyFrame,
   sessionIdOf,
   shouldNotifySession,
+  withSessionId,
   type HostNotifyFrame,
 } from './notify-events';
 import { profileNameFrom, storageEntries } from './storage-paths';
@@ -186,6 +190,50 @@ const ROUTE_PREFIX = '/dsh-pet-7340';
  * 桌面宿主 → 唤起桌面应用窗口（helper 走 `dsh://open`），其余 → 浏览器打开站点。
  */
 const isDesktopHost = (): boolean => Boolean(process.versions.electron);
+
+/**
+ * 唤起 `dsh://open` 的 CLI 命令（纯函数，可测）——ShellExecute 的平台等价物。
+ *
+ * 与桌面 Helper 右键「打开 DeepSeek Harness」走**同一条路**（helper 用 shell.openExternal；
+ * 宿主侧没有 Electron API，只能借系统 shell）：DSH 桌面端自己 `setAsDefaultProtocolClient('dsh')`
+ * → 第二实例锁把启动交给现有实例 → `focusPrimaryWindow()`（`isMinimized() → restore(); show(); focus()`）。
+ */
+export function dshOpenCommand(platform: NodeJS.Platform): { command: string; args: string[] } | undefined {
+  if (platform === 'win32') return { command: 'cmd.exe', args: ['/c', 'start', '', 'dsh://open'] };
+  if (platform === 'darwin') return { command: 'open', args: ['dsh://open'] };
+  if (platform === 'linux') return { command: 'xdg-open', args: ['dsh://open'] };
+  return undefined;
+}
+
+/**
+ * 把 DSH 桌面应用主窗口叫回前台（最小化 → 恢复 + 前置）；宿主不是桌面应用时 no-op。
+ *
+ * 【为什么必须由宿主侧发起】系统通知是**网页**（Electron 渲染进程）发的，那边的
+ * `window.focus()` 只能聚焦页面，恢复不了最小化的宿主窗口——Windows 的 SetForegroundWindow
+ * 对最小化窗口不还原（用户报的"点了通知打不开 DSH"）。页面够不着的这层只能由宿主动手。
+ *
+ * 【必须删 ELECTRON_RUN_AS_NODE】宿主自己就是被这个变量以纯 Node 模式拉起来的（见 dsh.cmd），
+ * 原样透传会给 `dsh://` 的处理程序（DSH exe）——起出来是 node 而非界面，协议空转、窗口照旧不出现
+ * （与 issue #63 同一个坑，见 helperSpawnEnv）。
+ */
+export function revealDesktopWindow(logger?: { warn?: (...args: unknown[]) => void }): boolean {
+  if (!isDesktopHost()) return false;
+  const spec = dshOpenCommand(process.platform);
+  if (!spec) return false;
+  try {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    delete env.ELECTRON_RUN_AS_NODE;
+    const child = spawn(spec.command, spec.args, { detached: true, stdio: 'ignore', windowsHide: true, env });
+    // 生态差异：spawn 失败（无 cmd.exe / 无 xdg-open）异步 emit 'error'，无人监听会升级成
+    // 未捕获异常直接崩掉宿主——唤起失败只该是"通知点了没反应"，不能反噬宿主。
+    child.once('error', (e: Error) => logger?.warn?.(`[dsh-pet] 唤起桌面窗口失败：${e.message}`));
+    child.unref();
+    return true;
+  } catch (e) {
+    logger?.warn?.(`[dsh-pet] 唤起桌面窗口失败：${e instanceof Error ? e.message : String(e)}`);
+    return false;
+  }
+}
 
 /** 不同扩展名对应的 Content-Type 映射 */
 const MIME: Record<string, string> = {
@@ -585,7 +633,7 @@ export function apply(ctx: any): void {
         void (async () => {
           if (await sessionHasRunningWork(sessionId)) return; // 还有活：等真正的收尾轮再弹
           const frame = reduceNotifyFrame(event as Parameters<typeof reduceNotifyFrame>[0]);
-          if (frame) pushNotifyFrame(frame);
+          if (frame) pushNotifyFrame(withSessionId(frame, sessionId));
         })();
       }, NOTIFY_ACTIVITY_DELAY_MS),
     );
@@ -1267,6 +1315,14 @@ export function apply(ctx: any): void {
       if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
       void syncDesktop();
       return { kind: 'json', status: 200, obj: { reloading: true } };
+    }
+
+    // 系统通知被点击（浏览器半侧 notify.ts 的点击处理，POST）：把 DSH 桌面应用主窗口叫回前台。
+    // 网页的 window.focus() 恢复不了最小化的 Electron 宿主窗口，这一层只能由宿主发起（见 revealDesktopWindow）。
+    // 非桌面宿主（dsh web / 独立模式）没有可唤起的窗口：no-op 回 {revealed:false}——浏览器自己会把标签页带前，不算失败。
+    if (rest === 'reveal') {
+      if (method !== 'POST') return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
+      return { kind: 'json', status: 200, obj: { revealed: revealDesktopWindow(ctx.logger) } };
     }
 
     // 配置文件路径 + 存储位置清单（设置页「高级配置」与「卸载与存储」展示用）
@@ -2187,7 +2243,10 @@ export function apply(ctx: any): void {
           return;
         }
         const frame = reduceNotifyFrame(event as Parameters<typeof reduceNotifyFrame>[0]);
-        if (frame) pushNotifyFrame(frame);
+        if (!frame) return;
+        // 帧带上"这条通知是哪条会话发出的"：点击通知时网页据此跳到那条会话（见 withSessionId / client/notify.ts）。
+        // 活动门那条延迟路径（上面的 scheduleCompletionNotify）同样要带——「对话完成」正是最常被点的一类。
+        pushNotifyFrame(withSessionId(frame, sessionIdOf(session)));
       },
     );
     // agent/error（agent-loop dispatch.emit）：无回合位置的生成失败；0.1.5 新增，

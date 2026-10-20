@@ -87,7 +87,17 @@ export function makeFactory(): (require: (mod: string) => any) => any {
       // 系统通知：host 侧监听 DSH 宿主事件生成通知帧，写进 /state 的 sections.notify；
       // 容器的统一轮询发现 counter 变化后调 notifyFromFrame 弹 toast（本引擎不再自己轮询）。
       // 不再依赖浏览器 connection 事件流（DSH 0.1.5 删除了 api.events.mux/host）。
-      ctx.effect(() => initNotify(), 'dsh-pet: notifications');
+      // 传入的会话跳转器包装 DSH 客户端的 uiWorkspace 服务：点击通知时页内跳到那条会话。
+      // **惰性取值**（调用时才 get）：该服务可能晚于本插件注册；旧版 DSH 没有它时取到 undefined，
+      // 点击退化成「只把窗口叫回前台」——不让通知整体失效。
+      ctx.effect(
+        () =>
+          initNotify({
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- DSH 注入服务无静态类型
+            openSession: (sessionId: string) => (ctx as any).get?.('uiWorkspace')?.openSession?.(sessionId),
+          }),
+        'dsh-pet: notifications',
+      );
 
       // /pet 选择框：裸输 /pet 回车或菜单点选时弹出桌宠列表，选中后提交 /pet <id> 由 host 命令落地。
       // commandUi 已声明为服务依赖（上方 inject）：插件只在「/」命令服务就绪后 apply，

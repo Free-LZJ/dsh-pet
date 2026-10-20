@@ -14,7 +14,7 @@
 import { PET_DISPLAYS } from '../shared/config';
 import { DEFAULT_FONT, FONT_PRESETS, FONT_SIZE_MAX, FONT_SIZE_MIN } from '../shared/fonts';
 import { DEFAULT_PHYSICS } from '../shared/physics';
-import { NOTIFY_ICONS, reloadNotifications, requestNotificationPermission } from './notify';
+import { NOTIFY_ICONS, reloadNotifications, requestNotificationPermission, wireNotificationClick } from './notify';
 import type { Corner, FontConfig, FontFamilyId, ModelSelection, Pet, PetDisplay, PhysicsParams } from '../shared/types';
 import type { ChangeEvent, Dispatch, FunctionComponent, SetStateAction } from 'react';
 import type * as ReactNS from 'react';
@@ -1139,8 +1139,10 @@ export function makePetConfigSection(rt: {
         return;
       }
       try {
-        // 成功即发一条测试通知验证链路（绕过聚焦门，直接确认）
-        new Notification('测试通知', { body: '【dsh-pet】系统通知已就绪。', icon: NOTIFY_ICONS.test });
+        // 成功即发一条测试通知验证链路（绕过聚焦门，直接确认）；点击行为与事件通知同一份实现
+        wireNotificationClick(
+          new Notification('测试通知', { body: '【dsh-pet】系统通知已就绪。', icon: NOTIFY_ICONS.test }),
+        );
       } catch {
         /* 个别环境构造失败：仍按已授权提示 */
       }
